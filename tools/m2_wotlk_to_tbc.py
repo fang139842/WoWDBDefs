@@ -1175,10 +1175,21 @@ class TBCWriter:
         self._pad4()
         colors_buf = bytearray(s.n_colors * TBC_COLOR_SIZE)
         colors_off = self._append(bytes(colors_buf))
+        # Color tracks: pad empty per-anim slots so every animation has
+        # a valid (rgb, alpha) keyframe even when the source did not
+        # keyframe this color for that animation. Without this, the TBC
+        # client computes NaN/Inf alpha during the empty animations and
+        # the entire batch using this color goes invisible.
+        rgb_identity = struct.pack("<fff", 1.0, 1.0, 1.0)
+        alpha_identity = struct.pack("<H", 32767)  # fixed16 = 1.0
         for i, c in enumerate(s.colors):
             base = colors_off + i * TBC_COLOR_SIZE
-            self._serialize_track(0x00, c.color, base, has_values=True)
-            self._serialize_track(0x1C, c.alpha, base, has_values=True)
+            self._serialize_track(
+                0x00, c.color, base, has_values=True, identity_value=rgb_identity
+            )
+            self._serialize_track(
+                0x1C, c.alpha, base, has_values=True, identity_value=alpha_identity
+            )
         self._array_field(0x54, s.n_colors, colors_off if s.n_colors else 0)
 
         # Textures (M2Texture[] -- 16 bytes each, name strings appended)
@@ -1193,39 +1204,75 @@ class TBCWriter:
             struct.pack_into("<II", self.out, base + 0x08, len(tname), n_off)
         self._array_field(0x5C, s.n_textures, tex_array_off if s.n_textures else 0)
 
-        # Texture weights (transparency) -- M2Track<fixed16>[]
+        # Texture weights (transparency) -- M2Track<fixed16>[]. Pad empty
+        # per-anim slots with the fully-opaque identity (32767 = 1.0)
+        # for the same reason we pad color tracks.
         self._pad4()
         tw_off = len(self.out)
         self.out.extend(b"\x00" * (s.n_transparency * TBC_TRACK_SIZE))
         for i, t in enumerate(s.transparencies):
-            self._serialize_track(0x00, t, tw_off + i * TBC_TRACK_SIZE, has_values=True)
+            self._serialize_track(
+                0x00, t, tw_off + i * TBC_TRACK_SIZE, has_values=True,
+                identity_value=struct.pack("<H", 32767),
+            )
         self._array_field(0x64, s.n_transparency, tw_off if s.n_transparency else 0)
 
-        # Unknown (TBC-only M2Array<uint16>) -- empty
-        self._array_field(0x6C, 0, 0)
-
         # Texture transforms (M2TextureTransform[] -- 84 bytes each in TBC)
+        # NOTE: TBC v260/v263 has tex_anims at 0x6C (one slot earlier than
+        # the converter previously placed it). Empirically verified against
+        # ``Eredar.M2``, ``Ogre.M2``, etc. -- their model bbox starts at
+        # 0xB4, which is only consistent with ``tex_anims`` at 0x6C and
+        # exactly six lookup tables (materials, bone_lookup, tex_lookup,
+        # tex_unit_lookup, transparency_lookup, uvanim_lookup) plus one
+        # NEW M2Array (texture_combiner_combos) at 0xAC.
         self._pad4()
         tt_off = len(self.out)
         self.out.extend(b"\x00" * (s.n_tex_anims * TBC_TEXTURE_TRANSFORM_SIZE))
+        # Texture transform tracks: pad empty per-anim slots with the
+        # identity transform (vec3 zero translation, identity quaternion
+        # rotation, vec3 one scaling).
+        tex_trans_identity = struct.pack("<fff", 0.0, 0.0, 0.0)
+        tex_rot_identity = struct.pack("<ffff", 0.0, 0.0, 0.0, 1.0)
+        tex_scale_identity = struct.pack("<fff", 1.0, 1.0, 1.0)
         for i, t in enumerate(s.tex_transforms):
             base = tt_off + i * TBC_TEXTURE_TRANSFORM_SIZE
-            self._serialize_track(0x00, t.translation, base, has_values=True)
-            self._serialize_track(0x1C, t.rotation, base, has_values=True)
-            self._serialize_track(0x38, t.scaling, base, has_values=True)
-        self._array_field(0x74, s.n_tex_anims, tt_off if s.n_tex_anims else 0)
+            self._serialize_track(
+                0x00, t.translation, base, has_values=True,
+                identity_value=tex_trans_identity,
+            )
+            self._serialize_track(
+                0x1C, t.rotation, base, has_values=True,
+                identity_value=tex_rot_identity,
+            )
+            self._serialize_track(
+                0x38, t.scaling, base, has_values=True,
+                identity_value=tex_scale_identity,
+            )
+        self._array_field(0x6C, s.n_tex_anims, tt_off if s.n_tex_anims else 0)
 
         # Replacable texture lookup (int16[])
         self._pad4()
         rt_off = self._append(s.replacable_texture_lookup) if s.n_tex_replace else 0
-        self._array_field(0x7C, s.n_tex_replace, rt_off)
+        self._array_field(0x74, s.n_tex_replace, rt_off)
 
-        # Materials (M2Material[] -- 4 bytes each)
+        # Materials (M2Material[] -- 4 bytes each).
         self._pad4()
         mat_off = self._append(s.materials) if s.n_materials else 0
-        self._array_field(0x84, s.n_materials, mat_off)
+        self._array_field(0x7C, s.n_materials, mat_off)
 
-        # Bone lookup table
+        # NEW IN TBC v260/v263: an extra ``M2Array<uint16>`` between
+        # Materials and BoneLookup. Looking at ``Ogre.M2`` (count=2 zeros)
+        # and ``Eredar.M2`` (count=5, mostly zeros) it appears to be
+        # tex_combiner_combos / bone_combos -- a small set of indices
+        # used by the TBC content tools but ignored by the runtime when
+        # the count is 0. WotLK has no source data here so we emit an
+        # empty array. Crucially this slot MUST be present, otherwise
+        # ``BoneLookup`` ends up at the wrong header offset and the body
+        # submesh skins to garbage -> invisible body.
+        self._array_field(0x84, 0, 0)
+
+        # Bone lookup table -- moved from 0x84 (where the converter
+        # previously placed it) to 0x8C to match real TBC v263 layout.
         self._pad4()
         bl_off = self._append(s.bone_lookup) if s.n_bone_lookup else 0
         self._array_field(0x8C, s.n_bone_lookup, bl_off)
@@ -1245,7 +1292,7 @@ class TBCWriter:
         trl_off = self._append(s.trans_lookup) if s.n_trans_lookup else 0
         self._array_field(0xA4, s.n_trans_lookup, trl_off)
 
-        # Texture transforms lookup
+        # Texture transforms lookup (uvanim_lookup)
         self._pad4()
         ttl_off = self._append(s.tex_anim_lookup) if s.n_tex_anim_lookup else 0
         self._array_field(0xAC, s.n_tex_anim_lookup, ttl_off)
