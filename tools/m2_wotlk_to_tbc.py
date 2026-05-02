@@ -39,7 +39,12 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 WOTLK_VERSION = 264
-TBC_VERSION = 260
+# TBC retail used version 263 (patch 2.4.3). Earlier patches used 260,
+# but every TBC v2.4 client we have a reference for embeds 263 in the
+# header, including the user's private server build. Some clients
+# explicitly compare the version number when deciding whether to load
+# the inline skin profile, so we always emit 263.
+TBC_VERSION = 263
 
 # Header
 WOTLK_HEADER_SIZE = 304
@@ -640,15 +645,16 @@ class WotLKReader:
     # -------------- skin discovery --------------
 
     def _discover_skins(self) -> list[bytes]:
-        """Return raw bytes of `<stem>NN.skin` for NN in 00..(n_views-1).
+        """Return raw bytes of every `<stem>NN.skin` LOD that exists on disk.
 
-        We always read every skin file that exists on disk so the converter
-        can decide later how many to embed (it tracks `n_views` from the
-        header). If a file is missing we abort -- a TBC client cannot find
-        the data otherwise.
+        TBC always embeds 4 views (LOD0..LOD3), so we try each numbered
+        skin from 00 up to 03. Some WotLK exports only ship a single LOD
+        even when `nViews > 1`; in that case we replicate LOD0 later when
+        embedding. The 00.skin file is mandatory -- a TBC client cannot
+        find the data otherwise.
         """
         skins: list[bytes] = []
-        for i in range(max(1, self.n_views)):
+        for i in range(4):
             skin_name = f"{self.stem}{i:02d}.skin"
             skin_path = os.path.join(self.dir, skin_name)
             if not os.path.exists(skin_path):
@@ -713,7 +719,23 @@ def restructure_skin_for_tbc(skin: bytes) -> TBCSkinProfile:
     vertex_indices_data = skin[ofs_verts:ofs_verts + n_verts * 2]
     triangle_indices_data = skin[ofs_tris:ofs_tris + n_tris * 2]
     bone_indices_data = skin[ofs_bones:ofs_bones + n_bones * SKIN_BONE_INFLUENCE_SIZE]
-    texture_units_data = skin[ofs_units:ofs_units + n_units * SKIN_TEXTURE_UNIT_SIZE]
+    texture_units_raw = skin[ofs_units:ofs_units + n_units * SKIN_TEXTURE_UNIT_SIZE]
+
+    # Texture units: every reference TBC v263 model we have (Eredar, Ogre,
+    # Chimera, CryptLord, Horisath) consistently uses ``Flags |= 0x10`` on
+    # *every* batch. This bit is set by the retail TBC content tools as a
+    # "this batch is part of the static rendering pass" marker; some 2.4.3
+    # client builds skip rendering when it isn't set, which causes the
+    # body submesh to silently disappear while the rig itself still
+    # animates. The 0x10 bit doesn't change WotLK behaviour either way
+    # (both eras OR it in implicitly), so we always set it here.
+    texture_units_buf = bytearray(texture_units_raw)
+    for i in range(n_units):
+        flags_off = i * SKIN_TEXTURE_UNIT_SIZE  # uint16 at offset 0
+        flags = struct.unpack_from("<H", texture_units_buf, flags_off)[0]
+        flags |= 0x10
+        struct.pack_into("<H", texture_units_buf, flags_off, flags)
+    texture_units_data = bytes(texture_units_buf)
 
     # Submeshes are 48 bytes in *both* WotLK and TBC: copy verbatim.
     submeshes_data = skin[ofs_subs:ofs_subs + n_subs * TBC_SUBMESH_SIZE]
@@ -777,6 +799,7 @@ def convert_track(
     track: WotLKTrack,
     sequences: list[WotLKSequence],
     n_global_seq: int,
+    identity_value: bytes | None = None,
 ) -> TBCTrackPayload:
     """Concat per-sequence WotLK keyframes into the TBC flat-array form.
 
@@ -845,6 +868,19 @@ def convert_track(
         # Per-sequence track. Append every sequence's keys back-to-back
         # and emit (cum_start, cum_end) per sequence, plus n_global_seq
         # trailing (0, 0) entries.
+        #
+        # When this animation has *no* keyframes for a given sequence and
+        # the caller has supplied an `identity_value`, we emit two
+        # placeholder keyframes at the sequence's (start, end) timestamps
+        # carrying the identity value. This matches the pattern used by
+        # every reference TBC v263 model we have (``Eredar.M2``,
+        # ``Ogre.M2``, etc.), which never have completely-empty per-anim
+        # slots inside an otherwise-populated bone track. Without this
+        # padding, the TBC client computes a degenerate transform when
+        # playing those animations, which collapses the body submesh to
+        # the origin and makes it visually disappear while the rig
+        # continues to animate (this is the well-known "body invisible
+        # but skeleton works" symptom).
         for s_idx, seq in enumerate(sequences):
             ts_bytes = track.ts_per_seq[s_idx] if s_idx < len(track.ts_per_seq) else b""
             n_keys = len(ts_bytes) // 4
@@ -854,11 +890,20 @@ def convert_track(
                 flat_ts.extend(struct.pack(f"<{n_keys}I", *shifted))
                 range_pairs.append((cum_idx, cum_idx + n_keys - 1))
                 cum_idx += n_keys
+                vs_bytes = track.vs_per_seq[s_idx] if s_idx < len(track.vs_per_seq) else None
+                if vs_bytes is not None:
+                    flat_vs.extend(vs_bytes)
+            elif identity_value is not None:
+                pad_ts = (seq.start_timestamp & 0xFFFFFFFF, seq.end_timestamp & 0xFFFFFFFF)
+                flat_ts.extend(struct.pack("<II", *pad_ts))
+                range_pairs.append((cum_idx, cum_idx + 1))
+                cum_idx += 2
+                flat_vs.extend(identity_value + identity_value)
             else:
                 range_pairs.append((-1, -1))
-            vs_bytes = track.vs_per_seq[s_idx] if s_idx < len(track.vs_per_seq) else None
-            if vs_bytes is not None:
-                flat_vs.extend(vs_bytes)
+                vs_bytes = track.vs_per_seq[s_idx] if s_idx < len(track.vs_per_seq) else None
+                if vs_bytes is not None:
+                    flat_vs.extend(vs_bytes)
         # Trailing global-sequence slots (unused for non-global tracks).
         for _ in range(n_global_seq):
             range_pairs.append((-1, -1))
@@ -942,15 +987,28 @@ class TBCWriter:
     # ----- track packing -----
 
     def _serialize_track(
-        self, off_in_struct: int, track: WotLKTrack, struct_base: int, has_values: bool
+        self,
+        off_in_struct: int,
+        track: WotLKTrack,
+        struct_base: int,
+        has_values: bool,
+        identity_value: bytes | None = None,
     ) -> None:
         """Convert + write a TBC M2Track at `struct_base + off_in_struct`.
 
         Track payload (interp_ranges, timestamps, values bytes) is appended
         to `self.out` first; the struct's local M2Track header is then
         written into the in-place struct buffer.
+
+        ``identity_value`` is the byte representation of the type-specific
+        identity (e.g. ``struct.pack("<3f", 0, 0, 0)`` for translation).
+        When supplied, empty per-animation slots are filled with two
+        placeholder keyframes carrying this value -- see ``convert_track``
+        for the rationale.
         """
-        payload = convert_track(track, self.src.sequences, self.src.n_global_seq)
+        payload = convert_track(
+            track, self.src.sequences, self.src.n_global_seq, identity_value=identity_value
+        )
         self._pad4()
         ranges_off = self._append(payload.interp_ranges_data) if payload.interp_ranges_count else 0
         self._pad4()
@@ -1045,9 +1103,23 @@ class TBCWriter:
             struct.pack_into("<h", self.out, base + 0x08, bone.parent_bone)
             struct.pack_into("<H", self.out, base + 0x0A, bone.submesh_id)
             struct.pack_into("<I", self.out, base + 0x0C, bone.bone_name_crc & 0xFFFFFFFF)
-            self._serialize_track(0x10, bone.translation, base, has_values=True)
-            self._serialize_track(0x2C, bone.rotation, base, has_values=True)
-            self._serialize_track(0x48, bone.scale, base, has_values=True)
+            # Bone tracks: pad empty per-anim slots with the bind-pose
+            # identity so the body submesh stays anchored to the rig
+            # during animations that don't keyframe this bone (without
+            # this padding the TBC client computes a degenerate transform
+            # and the body collapses to the origin / disappears).
+            self._serialize_track(
+                0x10, bone.translation, base, has_values=True,
+                identity_value=struct.pack("<fff", 0.0, 0.0, 0.0),
+            )
+            self._serialize_track(
+                0x2C, bone.rotation, base, has_values=True,
+                identity_value=struct.pack("<hhhh", 0, 0, 0, 32767),
+            )
+            self._serialize_track(
+                0x48, bone.scale, base, has_values=True,
+                identity_value=struct.pack("<fff", 1.0, 1.0, 1.0),
+            )
             struct.pack_into("<fff", self.out, base + 0x64, *bone.pivot)
         self._array_field(0x34, s.n_bones, bones_off)
 
@@ -1061,16 +1133,23 @@ class TBCWriter:
         verts_off = self._append(s.vertex_data) if s.n_vertices else 0
         self._array_field(0x44, s.n_vertices, verts_off)
 
-        # Skin profiles (TBC ONLY: inline). We embed only as many as
-        # n_views says even though the user may have supplied more.
-        n_views_to_embed = min(max(1, s.n_views), len(s.skins))
+        # Skin profiles (TBC ONLY: inline). Real TBC models always embed
+        # exactly 4 views (LOD0..LOD3); the client picks one based on
+        # camera distance. WotLK is the same. If the user only supplied
+        # fewer .skin files we replicate the highest-detail one to fill
+        # the remaining slots -- this matches LKBC_Converter's behaviour
+        # and is what the client expects when it indexes into views[k]
+        # for k up to ``nViews-1``.
+        n_views_to_embed = 4
         self._pad4()
         # Reserve space for `n_views_to_embed` profiles back-to-back.
         skin_array_off = len(self.out)
         self.out.extend(b"\x00" * (n_views_to_embed * SKIN_PROFILE_SIZE_TBC))
 
         for view_idx in range(n_views_to_embed):
-            prof = restructure_skin_for_tbc(s.skins[view_idx])
+            # Use the matching LOD if we have one, else fall back to LOD0.
+            skin_idx = view_idx if view_idx < len(s.skins) else 0
+            prof = restructure_skin_for_tbc(s.skins[skin_idx])
             self._pad4()
             v_off = self._append(prof.vertex_indices_data)
             self._pad4()
@@ -1096,10 +1175,21 @@ class TBCWriter:
         self._pad4()
         colors_buf = bytearray(s.n_colors * TBC_COLOR_SIZE)
         colors_off = self._append(bytes(colors_buf))
+        # Color tracks: pad empty per-anim slots so every animation has
+        # a valid (rgb, alpha) keyframe even when the source did not
+        # keyframe this color for that animation. Without this, the TBC
+        # client computes NaN/Inf alpha during the empty animations and
+        # the entire batch using this color goes invisible.
+        rgb_identity = struct.pack("<fff", 1.0, 1.0, 1.0)
+        alpha_identity = struct.pack("<H", 32767)  # fixed16 = 1.0
         for i, c in enumerate(s.colors):
             base = colors_off + i * TBC_COLOR_SIZE
-            self._serialize_track(0x00, c.color, base, has_values=True)
-            self._serialize_track(0x1C, c.alpha, base, has_values=True)
+            self._serialize_track(
+                0x00, c.color, base, has_values=True, identity_value=rgb_identity
+            )
+            self._serialize_track(
+                0x1C, c.alpha, base, has_values=True, identity_value=alpha_identity
+            )
         self._array_field(0x54, s.n_colors, colors_off if s.n_colors else 0)
 
         # Textures (M2Texture[] -- 16 bytes each, name strings appended)
@@ -1114,39 +1204,77 @@ class TBCWriter:
             struct.pack_into("<II", self.out, base + 0x08, len(tname), n_off)
         self._array_field(0x5C, s.n_textures, tex_array_off if s.n_textures else 0)
 
-        # Texture weights (transparency) -- M2Track<fixed16>[]
+        # Texture weights (transparency) -- M2Track<fixed16>[]. Pad empty
+        # per-anim slots with the fully-opaque identity (32767 = 1.0)
+        # for the same reason we pad color tracks.
         self._pad4()
         tw_off = len(self.out)
         self.out.extend(b"\x00" * (s.n_transparency * TBC_TRACK_SIZE))
         for i, t in enumerate(s.transparencies):
-            self._serialize_track(0x00, t, tw_off + i * TBC_TRACK_SIZE, has_values=True)
+            self._serialize_track(
+                0x00, t, tw_off + i * TBC_TRACK_SIZE, has_values=True,
+                identity_value=struct.pack("<H", 32767),
+            )
         self._array_field(0x64, s.n_transparency, tw_off if s.n_transparency else 0)
 
-        # Unknown (TBC-only M2Array<uint16>) -- empty
+        # NEW IN TBC v260/v263: an extra ``M2Array`` between transparencies
+        # and texture transforms. WotLK / Cataclysm REMOVED this slot, but
+        # in TBC the client reads it before texture_transforms. M2Lib calls
+        # this an "Unknown Ref" and skips parsing it. We emit an empty
+        # M2Array placeholder. Verified against ``Eredar.M2`` (count=0 at
+        # 0x6C, ofs=0) and ``Ogre.M2`` (same).
         self._array_field(0x6C, 0, 0)
 
-        # Texture transforms (M2TextureTransform[] -- 84 bytes each in TBC)
+        # Texture transforms (M2TextureTransform[] -- 84 bytes each in TBC).
+        # TBC client reads this at 0x74 (NOT 0x6C as the converter
+        # previously had). Verified by parsing real ``Eredar.M2`` /
+        # ``Ogre.M2`` -- their bbox starts at 0xB4 only if you account for
+        # the BC-only "Unknown Ref" slot at 0x6C, then tex_transforms at
+        # 0x74, replacable_texture_lookup at 0x7C, materials at 0x84.
         self._pad4()
         tt_off = len(self.out)
         self.out.extend(b"\x00" * (s.n_tex_anims * TBC_TEXTURE_TRANSFORM_SIZE))
+        # Texture transform tracks: pad empty per-anim slots with the
+        # identity transform (vec3 zero translation, identity quaternion
+        # rotation, vec3 one scaling).
+        tex_trans_identity = struct.pack("<fff", 0.0, 0.0, 0.0)
+        tex_rot_identity = struct.pack("<ffff", 0.0, 0.0, 0.0, 1.0)
+        tex_scale_identity = struct.pack("<fff", 1.0, 1.0, 1.0)
         for i, t in enumerate(s.tex_transforms):
             base = tt_off + i * TBC_TEXTURE_TRANSFORM_SIZE
-            self._serialize_track(0x00, t.translation, base, has_values=True)
-            self._serialize_track(0x1C, t.rotation, base, has_values=True)
-            self._serialize_track(0x38, t.scaling, base, has_values=True)
+            self._serialize_track(
+                0x00, t.translation, base, has_values=True,
+                identity_value=tex_trans_identity,
+            )
+            self._serialize_track(
+                0x1C, t.rotation, base, has_values=True,
+                identity_value=tex_rot_identity,
+            )
+            self._serialize_track(
+                0x38, t.scaling, base, has_values=True,
+                identity_value=tex_scale_identity,
+            )
         self._array_field(0x74, s.n_tex_anims, tt_off if s.n_tex_anims else 0)
 
-        # Replacable texture lookup (int16[])
+        # Replacable texture lookup (int16[]) -- shifted from 0x74 to 0x7C
+        # to match real TBC v263 layout.
         self._pad4()
         rt_off = self._append(s.replacable_texture_lookup) if s.n_tex_replace else 0
         self._array_field(0x7C, s.n_tex_replace, rt_off)
 
-        # Materials (M2Material[] -- 4 bytes each)
+        # Materials (M2Material[] -- 4 bytes each). Shifted from 0x7C to
+        # 0x84. With the wrong offset in v6, the TBC client read
+        # nMaterials=0 (an empty placeholder) -> NO MATERIALS DEFINED ->
+        # batch.materialIndex was an out-of-bounds read against an empty
+        # array -> the body submesh's render flags / blend mode were
+        # undefined -> body rendered transparent. Eyes/glow happened to
+        # render because they used a different code path or got lucky
+        # default state.
         self._pad4()
         mat_off = self._append(s.materials) if s.n_materials else 0
         self._array_field(0x84, s.n_materials, mat_off)
 
-        # Bone lookup table
+        # Bone lookup table at 0x8C -- this stays where it was in v6.
         self._pad4()
         bl_off = self._append(s.bone_lookup) if s.n_bone_lookup else 0
         self._array_field(0x8C, s.n_bone_lookup, bl_off)
@@ -1166,7 +1294,7 @@ class TBCWriter:
         trl_off = self._append(s.trans_lookup) if s.n_trans_lookup else 0
         self._array_field(0xA4, s.n_trans_lookup, trl_off)
 
-        # Texture transforms lookup
+        # Texture transforms lookup (uvanim_lookup)
         self._pad4()
         ttl_off = self._append(s.tex_anim_lookup) if s.n_tex_anim_lookup else 0
         self._array_field(0xAC, s.n_tex_anim_lookup, ttl_off)
