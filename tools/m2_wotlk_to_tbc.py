@@ -47,7 +47,7 @@ TBC_HEADER_SIZE = 324
 
 # Animated container sizes (bytes)
 WOTLK_BONE_SIZE = 88
-TBC_BONE_SIZE = 110
+TBC_BONE_SIZE = 112
 
 WOTLK_COLOR_SIZE = 40
 TBC_COLOR_SIZE = 56
@@ -227,13 +227,16 @@ class WotLKSequence:
         struct.pack_into("<HH", out, 0x00, self.id, self.sub_id)
         struct.pack_into("<II", out, 0x04, self.start_timestamp, self.end_timestamp)
         struct.pack_into("<f", out, 0x0C, self.movespeed)
-        # Keep only documented bits and force the "data is internal" flag
-        # (0x20). For aliases the bit is harmless; for the rest it correctly
-        # tells the client to look in the .m2 instead of an .anim file.
-        # Documented bits: 0x10, 0x20, 0x40, 0x80, 0x100.
-        cleaned = self.flags & 0x1F0
-        flags_internal = (cleaned | SEQ_FLAG_PRIMARY) & 0xFFFFFFFF
-        struct.pack_into("<I", out, 0x10, flags_internal)
+        # Real TBC v260/v263 models (Eredar, Ogre, etc.) only ever set the
+        # low flag bits 0x01..0x08 plus the alias bit 0x40. The WotLK
+        # "primary bone sequence / data is in .m2" bit (0x20) and the
+        # WotLK-only bookkeeping bit 0x10 are NOT used in TBC -- in TBC
+        # all keyframe data is always inline in the .m2, so 0x20 has no
+        # meaning and setting it confuses the client. We strip every bit
+        # except the small set that genuinely exists in TBC files.
+        TBC_VALID_FLAGS = 0x004F  # 0x01 | 0x02 | 0x04 | 0x08 | 0x40
+        cleaned = self.flags & TBC_VALID_FLAGS
+        struct.pack_into("<I", out, 0x10, cleaned & 0xFFFFFFFF)
         struct.pack_into("<hH", out, 0x14, self.frequency, self.padding)
         struct.pack_into("<II", out, 0x18, self.replay_min, self.replay_max)
         struct.pack_into("<I", out, 0x20, self.blend_time)
@@ -686,10 +689,14 @@ class TBCSkinProfile:
 def restructure_skin_for_tbc(skin: bytes) -> TBCSkinProfile:
     """Parse a WotLK .skin and return its TBC equivalent.
 
-    The skin file format is identical from vanilla through Cataclysm except
-    for `M2SkinSubmesh`, which gained `sort_center_position (vec3D)` and
-    `sort_radius (float32)` in TBC. We blow up every submesh from 32 to
-    48 bytes and copy the trailing fields as zeros.
+    Both WotLK and TBC skin files use the **same** 48-byte
+    ``M2SkinSubmesh`` layout (uint16 x10, center_position vec3D,
+    sort_center_position vec3D, sort_radius float32) -- the
+    ``sort_center_position`` / ``sort_radius`` fields were added all the
+    way back in TBC (= BC), not in WotLK. So the only restructuring we do
+    here is recompute ``bone_count_max`` if the source forgot to set it
+    (some WotLK files leave it at zero, which makes the TBC client refuse
+    to allocate any skinning palette).
     """
     if skin[:4] == SKIN_MAGIC:
         prof_off = 4
@@ -708,22 +715,20 @@ def restructure_skin_for_tbc(skin: bytes) -> TBCSkinProfile:
     bone_indices_data = skin[ofs_bones:ofs_bones + n_bones * SKIN_BONE_INFLUENCE_SIZE]
     texture_units_data = skin[ofs_units:ofs_units + n_units * SKIN_TEXTURE_UNIT_SIZE]
 
-    # Restructure submeshes: WotLK has 32 bytes (10 uint16 + 1 vec3D),
-    # TBC has 48 bytes (10 uint16 + 1 vec3D + 1 vec3D + float32).
-    submeshes_buf = bytearray(n_subs * TBC_SUBMESH_SIZE)
-    for i in range(n_subs):
-        src = ofs_subs + i * WOTLK_SUBMESH_SIZE
-        dst = i * TBC_SUBMESH_SIZE
-        # Copy 10 uint16 + vec3D (32 bytes total).
-        submeshes_buf[dst:dst + WOTLK_SUBMESH_SIZE] = skin[src:src + WOTLK_SUBMESH_SIZE]
-        # Initialize sort_center_position to the existing center_position
-        # and sort_radius to a conservative bound. The center_position lives
-        # at offset 0x14 (10 uint16 done = 20 bytes), 12 bytes wide.
-        center_x = f32(skin, src + 20)
-        center_y = f32(skin, src + 24)
-        center_z = f32(skin, src + 28)
-        struct.pack_into("<fff", submeshes_buf, dst + 32, center_x, center_y, center_z)
-        struct.pack_into("<f", submeshes_buf, dst + 44, 1.0)
+    # Submeshes are 48 bytes in *both* WotLK and TBC: copy verbatim.
+    submeshes_data = skin[ofs_subs:ofs_subs + n_subs * TBC_SUBMESH_SIZE]
+
+    # Recompute bone_count_max from the actual submesh data when the
+    # source skin file left it at 0. We use the largest single submesh
+    # bone_count, which is conservative but always correct: any submesh
+    # references at most that many distinct bones.
+    if bone_count_max == 0 and n_subs > 0:
+        max_bc = 0
+        for i in range(n_subs):
+            bc = u16(submeshes_data, i * TBC_SUBMESH_SIZE + 0x0C)
+            if bc > max_bc:
+                max_bc = bc
+        bone_count_max = max_bc
 
     return TBCSkinProfile(
         vertex_indices_count=n_verts,
@@ -733,7 +738,7 @@ def restructure_skin_for_tbc(skin: bytes) -> TBCSkinProfile:
         bone_indices_count=n_bones,
         bone_indices_data=bone_indices_data,
         submeshes_count=n_subs,
-        submeshes_data=bytes(submeshes_buf),
+        submeshes_data=submeshes_data,
         texture_units_count=n_units,
         texture_units_data=texture_units_data,
         bone_count_max=bone_count_max,
@@ -768,24 +773,33 @@ class TBCTrackPayload:
     values_offset: int = 0
 
 
-def convert_track(track: WotLKTrack, sequences: list[WotLKSequence]) -> TBCTrackPayload:
+def convert_track(
+    track: WotLKTrack,
+    sequences: list[WotLKSequence],
+    n_global_seq: int,
+) -> TBCTrackPayload:
     """Concat per-sequence WotLK keyframes into the TBC flat-array form.
 
-    For each sequence we emit one M2Range entry (min,max indices into the
-    flat timestamps array). Empty sequences are encoded as (cum,cum) which
-    points to nothing -- the client's interpolation routine sees an empty
-    window and skips this track for that animation.
+    Real TBC v260/v263 models store interpolation_ranges with exactly
+    ``nAnimations + nGlobalSequences`` entries: the first ``nAnimations``
+    describe the slice of the flat timestamps array that belongs to each
+    animation sequence, and the trailing ``nGlobalSequences`` entries
+    describe global-loop slots (filled with ``(0, 0)`` when this track
+    isn't tied to a global sequence).
+
+    For each sequence we emit one M2Range ``(min, max)`` of indices into
+    the flat timestamps array. Empty sequences end up pointing at index
+    ``0`` -- TBC clients dereference ``min`` unconditionally so we must
+    keep it in-bounds.
 
     When the source had no keyframe data at all we collapse the track to
     a fully-empty M2Track (zero interp_ranges, zero timestamps, zero
     values) which matches what real TBC models do for unanimated bones.
     """
     has_any_data = any(ts for ts in track.ts_per_seq)
+    track_has_values = any(v is not None for v in track.vs_per_seq)
+
     if not has_any_data:
-        # Detect whether this track ought to carry values at all by looking
-        # for a non-None per-sequence values entry. Pure event tracks set
-        # vs_per_seq[i]=None for every sequence.
-        track_has_values = any(v is not None for v in track.vs_per_seq)
         return TBCTrackPayload(
             interp_type=track.interp_type,
             global_sequence=track.global_sequence,
@@ -807,53 +821,54 @@ def convert_track(track: WotLKTrack, sequences: list[WotLKSequence]) -> TBCTrack
     range_pairs: list[tuple[int, int]] = []
     cum_idx = 0
 
-    for s_idx, seq in enumerate(sequences):
-        ts_bytes = track.ts_per_seq[s_idx] if s_idx < len(track.ts_per_seq) else b""
+    if track.global_sequence >= 0:
+        # Global-sequence track: WotLK stored exactly one inner array
+        # (placed under index 0 by the parser). The TBC layout still
+        # carries (nAnimations + nGlobalSequences) range entries, but
+        # only the slot at offset (nAnimations + global_sequence) is
+        # populated; the rest stay at (0, 0). The timestamps live in
+        # global-loop time so we don't shift them.
+        ts_bytes = track.ts_per_seq[0] if track.ts_per_seq else b""
         n_keys = len(ts_bytes) // 4
-        # Shift each timestamp into the global TBC timeline.
         if n_keys:
-            ts_arr = struct.unpack_from(f"<{n_keys}I", ts_bytes, 0)
-            shifted = [(t + seq.start_timestamp) & 0xFFFFFFFF for t in ts_arr]
-            flat_ts.extend(struct.pack(f"<{n_keys}I", *shifted))
-        if track.global_sequence >= 0:
-            # For global-sequence tracks WotLK stored exactly one inner
-            # array (placed under index 0 by the parser). We emit a single
-            # interpolation range covering that block at index 0 and stop.
-            if s_idx == 0:
-                if n_keys == 0:
-                    range_pairs.append((0, 0))
-                else:
-                    range_pairs.append((0, n_keys - 1))
-                    cum_idx = n_keys
-            break
-        # Standard per-sequence range
-        if n_keys == 0:
-            # Placeholder; we'll rewrite to a safe in-bounds (0, 0)
-            # after the total count is known.
+            flat_ts.extend(ts_bytes)
+        for _ in range(len(sequences)):
+            range_pairs.append((-1, -1))  # placeholder -> (0, 0)
+        for g_idx in range(n_global_seq):
+            if g_idx == track.global_sequence and n_keys:
+                range_pairs.append((0, n_keys - 1))
+            else:
+                range_pairs.append((-1, -1))
+        if track_has_values and track.vs_per_seq and track.vs_per_seq[0] is not None:
+            flat_vs.extend(track.vs_per_seq[0])
+    else:
+        # Per-sequence track. Append every sequence's keys back-to-back
+        # and emit (cum_start, cum_end) per sequence, plus n_global_seq
+        # trailing (0, 0) entries.
+        for s_idx, seq in enumerate(sequences):
+            ts_bytes = track.ts_per_seq[s_idx] if s_idx < len(track.ts_per_seq) else b""
+            n_keys = len(ts_bytes) // 4
+            if n_keys:
+                ts_arr = struct.unpack_from(f"<{n_keys}I", ts_bytes, 0)
+                shifted = [(t + seq.start_timestamp) & 0xFFFFFFFF for t in ts_arr]
+                flat_ts.extend(struct.pack(f"<{n_keys}I", *shifted))
+                range_pairs.append((cum_idx, cum_idx + n_keys - 1))
+                cum_idx += n_keys
+            else:
+                range_pairs.append((-1, -1))
+            vs_bytes = track.vs_per_seq[s_idx] if s_idx < len(track.vs_per_seq) else None
+            if vs_bytes is not None:
+                flat_vs.extend(vs_bytes)
+        # Trailing global-sequence slots (unused for non-global tracks).
+        for _ in range(n_global_seq):
             range_pairs.append((-1, -1))
-        else:
-            range_pairs.append((cum_idx, cum_idx + n_keys - 1))
-            cum_idx += n_keys
-        # Values: raw byte concat (no shifting).
-        vs_bytes = track.vs_per_seq[s_idx] if s_idx < len(track.vs_per_seq) else None
-        if vs_bytes is not None:
-            flat_vs.extend(vs_bytes)
 
-    # Patch empty placeholders. If we have any keyframes globally, point
-    # empties at index 0 -- the client will read a real keyframe and treat
-    # the sequence as a static pose. If we have no keyframes anywhere,
-    # the early-return at the top would have triggered, so cum_idx > 0
-    # whenever we get here.
     interp_ranges = bytearray()
     for rmin, rmax in range_pairs:
         if rmin < 0:
             interp_ranges.extend(struct.pack("<II", 0, 0))
         else:
             interp_ranges.extend(struct.pack("<II", rmin, rmax))
-
-    has_values = any(v is not None for v in track.vs_per_seq)
-    if track.global_sequence >= 0 and has_values and len(track.vs_per_seq) > 0 and track.vs_per_seq[0] is not None:
-        flat_vs = bytearray(track.vs_per_seq[0])
 
     return TBCTrackPayload(
         interp_type=track.interp_type,
@@ -862,9 +877,9 @@ def convert_track(track: WotLKTrack, sequences: list[WotLKSequence]) -> TBCTrack
         interp_ranges_data=bytes(interp_ranges),
         timestamps_count=(len(flat_ts) // 4),
         timestamps_data=bytes(flat_ts),
-        has_values=has_values,
-        values_count=(len(flat_vs) // max(1, _values_size_from_track(track))) if has_values else 0,
-        values_data=bytes(flat_vs) if has_values else b"",
+        has_values=track_has_values,
+        values_count=(len(flat_vs) // max(1, _values_size_from_track(track))) if track_has_values else 0,
+        values_data=bytes(flat_vs) if track_has_values else b"",
     )
 
 
@@ -935,7 +950,7 @@ class TBCWriter:
         to `self.out` first; the struct's local M2Track header is then
         written into the in-place struct buffer.
         """
-        payload = convert_track(track, self.src.sequences)
+        payload = convert_track(track, self.src.sequences, self.src.n_global_seq)
         self._pad4()
         ranges_off = self._append(payload.interp_ranges_data) if payload.interp_ranges_count else 0
         self._pad4()
@@ -1018,20 +1033,22 @@ class TBCWriter:
         # Now overwrite each bone's bytes inside `self.out`.
         for i, bone in enumerate(s.bones):
             base = bones_off + i * TBC_BONE_SIZE
-            # Header (14 bytes) -- pre-WotLK layout drops the high 2 bytes
-            # of bone_name_crc (they were a debugging hash that the runtime
-            # ignores in TBC).
+                # Header layout (TBC, total 16 bytes before tracks):
+            #   int32  key_bone_id
+            #   uint32 flags
+            #   int16  parent_bone
+            #   uint16 submesh_id
+            #   uint32 bone_name_crc
+            # Then 3x M2Track at 0x10, 0x2C, 0x48 and vec3D pivot at 0x64.
             struct.pack_into("<i", self.out, base + 0x00, bone.key_bone_id)
             struct.pack_into("<I", self.out, base + 0x04, bone.flags)
             struct.pack_into("<h", self.out, base + 0x08, bone.parent_bone)
             struct.pack_into("<H", self.out, base + 0x0A, bone.submesh_id)
-            struct.pack_into("<H", self.out, base + 0x0C, bone.bone_name_crc & 0xFFFF)
-            # 3x M2Track at offsets 0x0E, 0x2A, 0x46
-            self._serialize_track(0x0E, bone.translation, base, has_values=True)
-            self._serialize_track(0x2A, bone.rotation, base, has_values=True)
-            self._serialize_track(0x46, bone.scale, base, has_values=True)
-            # Pivot at offset 0x62
-            struct.pack_into("<fff", self.out, base + 0x62, *bone.pivot)
+            struct.pack_into("<I", self.out, base + 0x0C, bone.bone_name_crc & 0xFFFFFFFF)
+            self._serialize_track(0x10, bone.translation, base, has_values=True)
+            self._serialize_track(0x2C, bone.rotation, base, has_values=True)
+            self._serialize_track(0x48, bone.scale, base, has_values=True)
+            struct.pack_into("<fff", self.out, base + 0x64, *bone.pivot)
         self._array_field(0x34, s.n_bones, bones_off)
 
         # Key bone lookup
