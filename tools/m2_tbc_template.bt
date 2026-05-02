@@ -1,0 +1,396 @@
+//------------------------------------------------
+//--- 010 Editor v8.0 Binary Template
+//
+//      File: m2_tbc_template.bt
+//   Authors: WoWDBDefs contributors
+//   Version: 1.0
+//   Purpose: Parse World of Warcraft M2 model files
+//            in TBC format (version 260).
+//
+//   Reference: https://wowdev.wiki/M2
+//
+//   说明 (Chinese notes):
+//     该模板针对 TBC 客户端 (2.4.3) 使用的 M2 v260 文件格式。
+//     与 WotLK v264 的关键差异：
+//       - Header 长度为 324 字节 (WotLK 为 304)。
+//       - 多出 playable_animation_lookup / ofsViews / texture_flipbooks 字段。
+//       - skin / view 数据嵌入在 M2 内部，而不是外部 .skin 文件。
+//       - 动画关键帧数据全部内联，没有外部 .anim 文件。
+//------------------------------------------------
+
+LittleEndian();
+
+// ---------------------------------------------------------------------------
+// 通用基础类型 / Common building blocks
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    float x;
+    float y;
+    float z;
+} C3Vector <read=ReadC3Vector>;
+
+string ReadC3Vector(C3Vector &v) {
+    string s;
+    SPrintf(s, "(%f, %f, %f)", v.x, v.y, v.z);
+    return s;
+}
+
+typedef struct {
+    float x;
+    float y;
+} C2Vector;
+
+typedef struct {
+    C3Vector min;
+    C3Vector max;
+} CAaBox;
+
+typedef struct {
+    int16 x;
+    int16 y;
+    int16 z;
+    int16 w;
+} M2CompQuat;
+
+// M2Array<T> = uint32 count + uint32 offset; the offset is absolute and
+// points into the M2 file. 通用 M2 数组类型。
+typedef struct {
+    uint32 count <bgcolor=cLtGray, comment="数量">;
+    uint32 offset <bgcolor=cLtGray, comment="偏移">;
+} M2Array <read=ReadM2Array>;
+
+string ReadM2Array(M2Array &a) {
+    string s;
+    SPrintf(s, "{count=%u, offset=0x%X}", a.count, a.offset);
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// Animation / track structures (WotLK-style 20-byte M2Track is also accepted
+// by some custom TBC clients; vanilla TBC uses a 28-byte M2Track containing
+// an extra interpolation_ranges M2Array — adjust as needed for your client).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint16  interpolation_type <comment="0=none, 1=linear, 2=hermite">;
+    int16   global_sequence    <comment="-1 if not used">;
+    M2Array timestamps         <comment="WotLK: M2Array<M2Array<uint32>>">;
+    M2Array values             <comment="WotLK: M2Array<M2Array<T>>">;
+} M2Track;
+
+typedef struct {
+    uint16  animation_id       <bgcolor=cLtYellow, comment="AnimationData.dbc">;
+    uint16  sub_anim_id        <bgcolor=cLtYellow, comment="变体序号">;
+    uint32  length             <comment="毫秒">;
+    float   moving_speed;
+    uint32  flags              <bgcolor=cYellow, comment="bit 0x20 = 数据在 m2 内">;
+    int16   probability;
+    uint16  padding;
+    uint32  unused0;
+    uint32  unused1;
+    uint32  blend_time;
+    C3Vector bounds_min;
+    C3Vector bounds_max;
+    float   bound_radius;
+    int16   next_animation;
+    uint16  alias_next;
+} M2Sequence <read=ReadSequence>;
+
+string ReadSequence(M2Sequence &s) {
+    string out;
+    SPrintf(out, "anim=%u-%u, len=%u ms, flags=0x%X", s.animation_id,
+            s.sub_anim_id, s.length, s.flags);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// 几何 / Geometry
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    C3Vector pos;
+    uint8    bone_weights[4];
+    uint8    bone_indices[4];
+    C3Vector normal;
+    C2Vector tex_coords;
+    C2Vector tex_coords2;
+} M2Vertex;
+
+typedef struct {
+    int32   key_bone_id  <comment="key bone lookup 中的索引,-1 表示无">;
+    uint32  flags;
+    int16   parent_bone;
+    uint16  submesh_id;
+    uint32  bone_name_crc;
+    M2Track translation;
+    M2Track rotation;
+    M2Track scale;
+    C3Vector pivot;
+} M2CompBone <bgcolor=cLtGreen>;
+
+typedef struct {
+    uint16 flags;
+    uint16 blending_mode;
+} M2Material;
+
+typedef struct {
+    M2Track color;
+    M2Track alpha;
+} M2Color <bgcolor=cLtPurple>;
+
+typedef struct {
+    uint32  type   <comment="0=hard-coded, otherwise replaceable slot">;
+    uint32  flags;
+    M2Array filename;
+} M2Texture <bgcolor=cLtPurple>;
+
+typedef struct {
+    M2Track weight;
+} M2TextureWeight;
+
+typedef struct {
+    M2Track translation;
+    M2Track rotation;
+    M2Track scale;
+} M2TextureTransform;
+
+typedef struct {
+    uint32   id        <comment="see AttachmentPoint enum">;
+    uint16   bone;
+    uint16   unknown;
+    C3Vector position;
+    M2Track  animate_attached;
+} M2Attachment <bgcolor=cLtBlue>;
+
+typedef struct {
+    char     identifier[4] <comment="4 字符事件 ID">;
+    uint32   data;
+    uint32   bone;
+    C3Vector position;
+    uint16   interpolation_type;
+    int16    global_sequence;
+    M2Array  timestamps;
+} M2Event <bgcolor=cLtBlue>;
+
+typedef struct {
+    uint16   type            <comment="0=directional, 1=point">;
+    int16    bone;
+    C3Vector position;
+    M2Track  ambient_color;
+    M2Track  ambient_intensity;
+    M2Track  diffuse_color;
+    M2Track  diffuse_intensity;
+    M2Track  attenuation_start;
+    M2Track  attenuation_end;
+    M2Track  visibility;
+} M2Light <bgcolor=cLtBlue>;
+
+typedef struct {
+    int32    type;
+    float    fov;
+    float    far_clip;
+    float    near_clip;
+    M2Track  positions;
+    C3Vector position_base;
+    M2Track  target_position;
+    C3Vector target_position_base;
+    M2Track  roll;
+} M2Camera <bgcolor=cLtBlue>;
+
+// ---------------------------------------------------------------------------
+// 嵌入的 Skin / View 数据 (TBC: ofsViews 指向 M2SkinProfile 数组)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint16 skin_section_id;
+    uint16 level;
+    uint16 vertex_start;
+    uint16 vertex_count;
+    uint16 index_start;
+    uint16 index_count;
+    uint16 bone_count;
+    uint16 bone_combo_index;
+    uint16 bone_influences;
+    uint16 center_bone_index;
+    C3Vector center_position;
+    C3Vector sort_center_position;
+    float    sort_radius;
+} M2SkinSection;
+
+typedef struct {
+    uint8    flags;
+    uint8    priority_plane;
+    uint16   shader_id;
+    uint16   skin_section_index;
+    uint16   geoset_index;
+    uint16   color_index;
+    uint16   material_index;
+    uint16   material_layer;
+    uint16   texture_count;
+    uint16   texture_combo_index;
+    uint16   texture_coord_combo_index;
+    uint16   texture_weight_combo_index;
+    uint16   texture_transform_combo_index;
+} M2Batch;
+
+typedef struct {
+    M2Array vertices    <comment="vertex lookup, 每项 uint16">;
+    M2Array indices     <comment="triangle indices, 每项 uint16">;
+    M2Array bones       <comment="ubyte4 bone influences">;
+    M2Array submeshes   <comment="M2SkinSection 列表">;
+    M2Array batches     <comment="M2Batch 列表">;
+    uint32  bone_count_max;
+} M2SkinProfile <bgcolor=cLtRed>;
+
+// ---------------------------------------------------------------------------
+// M2 v260 (TBC) 主 header — 共 324 字节
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    char    magic[4]                      <bgcolor=cRed, comment="\"MD20\"">;
+    uint32  version                       <bgcolor=cRed, comment="260 = TBC, 264 = WotLK">;
+    M2Array name                          <comment="模型名称">;
+    uint32  global_flags                  <bgcolor=cYellow>;
+    M2Array global_loops                  <comment="全局循环时间戳">;
+    M2Array sequences                     <bgcolor=cAqua, comment="动画序列">;
+    M2Array sequence_lookup               <comment="按 ID 查找 sequences">;
+
+    M2Array playable_animation_lookup     <bgcolor=cLtAqua, comment="TBC 独有">;
+
+    M2Array bones                         <bgcolor=cGreen, comment="骨骼">;
+    M2Array key_bone_lookup;
+    M2Array vertices                      <bgcolor=cGreen, comment="顶点">;
+    uint32  num_views                     <bgcolor=cRed, comment="视图 / LOD 数量">;
+    uint32  ofs_views                     <bgcolor=cRed, comment="TBC 独有: 嵌入 skin profile 数组">;
+
+    M2Array colors                        <bgcolor=cLtPurple>;
+    M2Array textures                      <bgcolor=cLtPurple>;
+    M2Array texture_weights               <bgcolor=cLtPurple>;
+
+    M2Array texture_flipbooks             <bgcolor=cLtAqua, comment="TBC 独有 (通常空)">;
+
+    M2Array texture_transforms            <bgcolor=cLtPurple>;
+    M2Array replaceable_texture_lookup;
+    M2Array materials;
+    M2Array bone_lookup_table;
+    M2Array texture_lookup_table;
+    M2Array tex_unit_lookup_table;
+    M2Array transparency_lookup_table;
+    M2Array texture_transforms_lookup_table;
+
+    CAaBox  bounding_box                  <bgcolor=cYellow>;
+    float   bounding_sphere_radius        <bgcolor=cYellow>;
+    CAaBox  collision_box                 <bgcolor=cYellow>;
+    float   collision_sphere_radius       <bgcolor=cYellow>;
+
+    M2Array collision_indices;
+    M2Array collision_positions;
+    M2Array collision_face_normals;
+
+    M2Array attachments                   <bgcolor=cLtBlue>;
+    M2Array attachment_lookup_table;
+
+    M2Array events                        <bgcolor=cLtBlue>;
+    M2Array lights                        <bgcolor=cLtBlue>;
+    M2Array cameras                       <bgcolor=cLtBlue>;
+    M2Array camera_lookup_table;
+
+    M2Array ribbon_emitters               <bgcolor=cLtBlue>;
+    M2Array particle_emitters             <bgcolor=cLtBlue>;
+} M2HeaderTBC <bgcolor=cBlack, fgcolor=cWhite>;
+
+// ---------------------------------------------------------------------------
+// 解析入口
+// ---------------------------------------------------------------------------
+
+local int64 _save_pos = 0;
+
+M2HeaderTBC header;
+
+if (header.magic != "MD20") {
+    Warning("Not an M2 file (missing MD20 magic).");
+    return -1;
+}
+if (header.version != 260) {
+    Warning("This template targets TBC v260 — file is version %u.",
+            header.version);
+}
+
+// 序列详细信息 / Sequences
+if (header.sequences.count > 0 && header.sequences.offset > 0) {
+    FSeek(header.sequences.offset);
+    M2Sequence sequences[header.sequences.count] <optimize=false>;
+}
+
+// 骨骼 / Bones
+if (header.bones.count > 0 && header.bones.offset > 0) {
+    FSeek(header.bones.offset);
+    M2CompBone bones[header.bones.count] <optimize=false>;
+}
+
+// 顶点 / Vertices
+if (header.vertices.count > 0 && header.vertices.offset > 0) {
+    FSeek(header.vertices.offset);
+    M2Vertex vertices[header.vertices.count] <optimize=false>;
+}
+
+// 颜色 / Colors
+if (header.colors.count > 0 && header.colors.offset > 0) {
+    FSeek(header.colors.offset);
+    M2Color colors[header.colors.count] <optimize=false>;
+}
+
+// 纹理 / Textures
+if (header.textures.count > 0 && header.textures.offset > 0) {
+    FSeek(header.textures.offset);
+    M2Texture textures[header.textures.count] <optimize=false>;
+}
+
+// 纹理权重 / Texture weights
+if (header.texture_weights.count > 0 && header.texture_weights.offset > 0) {
+    FSeek(header.texture_weights.offset);
+    M2TextureWeight texture_weights[header.texture_weights.count] <optimize=false>;
+}
+
+// 纹理变换 / Texture transforms
+if (header.texture_transforms.count > 0 && header.texture_transforms.offset > 0) {
+    FSeek(header.texture_transforms.offset);
+    M2TextureTransform texture_transforms[header.texture_transforms.count] <optimize=false>;
+}
+
+// 材质 / Materials
+if (header.materials.count > 0 && header.materials.offset > 0) {
+    FSeek(header.materials.offset);
+    M2Material materials[header.materials.count] <optimize=false>;
+}
+
+// 附加点 / Attachments
+if (header.attachments.count > 0 && header.attachments.offset > 0) {
+    FSeek(header.attachments.offset);
+    M2Attachment attachments[header.attachments.count] <optimize=false>;
+}
+
+// 事件 / Events
+if (header.events.count > 0 && header.events.offset > 0) {
+    FSeek(header.events.offset);
+    M2Event events[header.events.count] <optimize=false>;
+}
+
+// 灯光 / Lights
+if (header.lights.count > 0 && header.lights.offset > 0) {
+    FSeek(header.lights.offset);
+    M2Light lights[header.lights.count] <optimize=false>;
+}
+
+// 摄像机 / Cameras
+if (header.cameras.count > 0 && header.cameras.offset > 0) {
+    FSeek(header.cameras.offset);
+    M2Camera cameras[header.cameras.count] <optimize=false>;
+}
+
+// 嵌入的 skin / view (TBC 独有)
+if (header.num_views > 0 && header.ofs_views > 0) {
+    FSeek(header.ofs_views);
+    M2SkinProfile skin_profiles[header.num_views] <optimize=false>;
+}
