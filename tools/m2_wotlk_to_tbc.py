@@ -1217,14 +1217,20 @@ class TBCWriter:
             )
         self._array_field(0x64, s.n_transparency, tw_off if s.n_transparency else 0)
 
-        # Texture transforms (M2TextureTransform[] -- 84 bytes each in TBC)
-        # NOTE: TBC v260/v263 has tex_anims at 0x6C (one slot earlier than
-        # the converter previously placed it). Empirically verified against
-        # ``Eredar.M2``, ``Ogre.M2``, etc. -- their model bbox starts at
-        # 0xB4, which is only consistent with ``tex_anims`` at 0x6C and
-        # exactly six lookup tables (materials, bone_lookup, tex_lookup,
-        # tex_unit_lookup, transparency_lookup, uvanim_lookup) plus one
-        # NEW M2Array (texture_combiner_combos) at 0xAC.
+        # NEW IN TBC v260/v263: an extra ``M2Array`` between transparencies
+        # and texture transforms. WotLK / Cataclysm REMOVED this slot, but
+        # in TBC the client reads it before texture_transforms. M2Lib calls
+        # this an "Unknown Ref" and skips parsing it. We emit an empty
+        # M2Array placeholder. Verified against ``Eredar.M2`` (count=0 at
+        # 0x6C, ofs=0) and ``Ogre.M2`` (same).
+        self._array_field(0x6C, 0, 0)
+
+        # Texture transforms (M2TextureTransform[] -- 84 bytes each in TBC).
+        # TBC client reads this at 0x74 (NOT 0x6C as the converter
+        # previously had). Verified by parsing real ``Eredar.M2`` /
+        # ``Ogre.M2`` -- their bbox starts at 0xB4 only if you account for
+        # the BC-only "Unknown Ref" slot at 0x6C, then tex_transforms at
+        # 0x74, replacable_texture_lookup at 0x7C, materials at 0x84.
         self._pad4()
         tt_off = len(self.out)
         self.out.extend(b"\x00" * (s.n_tex_anims * TBC_TEXTURE_TRANSFORM_SIZE))
@@ -1248,31 +1254,27 @@ class TBCWriter:
                 0x38, t.scaling, base, has_values=True,
                 identity_value=tex_scale_identity,
             )
-        self._array_field(0x6C, s.n_tex_anims, tt_off if s.n_tex_anims else 0)
+        self._array_field(0x74, s.n_tex_anims, tt_off if s.n_tex_anims else 0)
 
-        # Replacable texture lookup (int16[])
+        # Replacable texture lookup (int16[]) -- shifted from 0x74 to 0x7C
+        # to match real TBC v263 layout.
         self._pad4()
         rt_off = self._append(s.replacable_texture_lookup) if s.n_tex_replace else 0
-        self._array_field(0x74, s.n_tex_replace, rt_off)
+        self._array_field(0x7C, s.n_tex_replace, rt_off)
 
-        # Materials (M2Material[] -- 4 bytes each).
+        # Materials (M2Material[] -- 4 bytes each). Shifted from 0x7C to
+        # 0x84. With the wrong offset in v6, the TBC client read
+        # nMaterials=0 (an empty placeholder) -> NO MATERIALS DEFINED ->
+        # batch.materialIndex was an out-of-bounds read against an empty
+        # array -> the body submesh's render flags / blend mode were
+        # undefined -> body rendered transparent. Eyes/glow happened to
+        # render because they used a different code path or got lucky
+        # default state.
         self._pad4()
         mat_off = self._append(s.materials) if s.n_materials else 0
-        self._array_field(0x7C, s.n_materials, mat_off)
+        self._array_field(0x84, s.n_materials, mat_off)
 
-        # NEW IN TBC v260/v263: an extra ``M2Array<uint16>`` between
-        # Materials and BoneLookup. Looking at ``Ogre.M2`` (count=2 zeros)
-        # and ``Eredar.M2`` (count=5, mostly zeros) it appears to be
-        # tex_combiner_combos / bone_combos -- a small set of indices
-        # used by the TBC content tools but ignored by the runtime when
-        # the count is 0. WotLK has no source data here so we emit an
-        # empty array. Crucially this slot MUST be present, otherwise
-        # ``BoneLookup`` ends up at the wrong header offset and the body
-        # submesh skins to garbage -> invisible body.
-        self._array_field(0x84, 0, 0)
-
-        # Bone lookup table -- moved from 0x84 (where the converter
-        # previously placed it) to 0x8C to match real TBC v263 layout.
+        # Bone lookup table at 0x8C -- this stays where it was in v6.
         self._pad4()
         bl_off = self._append(s.bone_lookup) if s.n_bone_lookup else 0
         self._array_field(0x8C, s.n_bone_lookup, bl_off)
