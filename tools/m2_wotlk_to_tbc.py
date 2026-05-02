@@ -97,9 +97,14 @@ TRACKS_IN_TEX_TFM = 3    # translation, rotation, scaling
 TRACKS_IN_LIGHT = 7
 TRACKS_IN_CAMERA = 3
 
-# .skin file M2SkinProfile header layout (WotLK / TBC, 44 bytes).
-# vertices/indices/bones/submeshes/batches are M2Array<...> = (count, offset).
-SKIN_HEADER_SIZE = 44
+# WotLK .skin files begin with a 4-byte 'SKIN' magic, followed by the
+# 44-byte M2SkinProfile header, followed by the data the profile's
+# M2Arrays point at.  Offsets stored inside the M2SkinProfile are
+# relative to the start of the .skin file (i.e. include the 4 magic
+# bytes).  Older clients sometimes ship the header without the magic,
+# so the loader auto-detects which form was provided.
+SKIN_MAGIC = b"SKIN"
+SKIN_PROFILE_SIZE = 44
 SKIN_M2ARRAY_FIELD_OFFSETS = (0, 8, 16, 24, 32)  # count fields; offset = +4
 
 # ---------------------------------------------------------------------------
@@ -431,46 +436,76 @@ def build_tbc_header(wotlk_data: bytes) -> bytearray:
 # ---------------------------------------------------------------------------
 
 
+def _split_skin_blob(blob: bytes, idx: int) -> Tuple[bytes, bytes, int]:
+    """Return (profile_bytes, payload_bytes, header_size_in_skin_file).
+
+    ``header_size_in_skin_file`` is the byte offset, **inside the .skin
+    file**, where the data section starts — i.e. the value that needs to
+    be subtracted when relocating an offset out of the .skin file and into
+    the M2.  WotLK skins start with a 4-byte ``'SKIN'`` magic; pre-WotLK
+    development builds sometimes ship without it.
+    """
+    if blob[:4] == SKIN_MAGIC:
+        header = 4 + SKIN_PROFILE_SIZE
+        if len(blob) < header:
+            raise ValueError(
+                f"Skin file #{idx} too small ({len(blob)} bytes) for "
+                f"SKIN magic + M2SkinProfile"
+            )
+        return blob[4:header], blob[header:], header
+    if len(blob) < SKIN_PROFILE_SIZE:
+        raise ValueError(
+            f"Skin file #{idx} too small ({len(blob)} bytes) for M2SkinProfile"
+        )
+    return blob[:SKIN_PROFILE_SIZE], blob[SKIN_PROFILE_SIZE:], SKIN_PROFILE_SIZE
+
+
 def embed_skin_files(
     out_buf: bytearray,
     skin_blobs: List[bytes],
+    verbose: bool = True,
 ) -> int:
     """Embed all .skin files into ``out_buf`` and return the byte position
     of the contiguous M2SkinProfile array (= TBC ``ofsViews``).
 
-    For each .skin file, the first 44 bytes are the ``M2SkinProfile`` header
-    and the rest is the data the header's M2Arrays point to.  We:
+    Algorithm per .skin file:
 
-    1. Reserve ``len(skin_blobs) * 44`` bytes at ``skin_array_pos`` for the
-       M2SkinProfile array.
-    2. For each skin, append the data section (skin[44:]) to the buffer and
-       patch the M2SkinProfile header so that its 5 M2Array offsets point
-       at the new in-file location of that data section.
-    3. Write the patched 44-byte header into the reserved array slot.
+    1. Detect and strip the optional 4-byte ``'SKIN'`` magic.
+    2. Append the data section (everything after the M2SkinProfile) to
+       ``out_buf`` at ``data_pos``.
+    3. Patch the M2SkinProfile's 5 M2Array offsets so they point at the
+       embedded data: ``new = data_pos + (old - skin_header_size)``.
+    4. Write the patched 44-byte M2SkinProfile into a contiguous array
+       reserved at ``skin_array_pos``.
     """
     if not skin_blobs:
         return 0
 
     skin_array_pos = len(out_buf)
-    out_buf.extend(b"\x00" * (len(skin_blobs) * SKIN_HEADER_SIZE))
+    out_buf.extend(b"\x00" * (len(skin_blobs) * SKIN_PROFILE_SIZE))
 
     for i, blob in enumerate(skin_blobs):
-        if len(blob) < SKIN_HEADER_SIZE:
-            raise ValueError(f"Skin file #{i} too small ({len(blob)} bytes)")
+        profile_bytes, payload, skin_header_size = _split_skin_blob(blob, i)
 
         data_pos = len(out_buf)
-        out_buf.extend(blob[SKIN_HEADER_SIZE:])
-        # offset_in_skin >= 44  -> data_pos + (offset_in_skin - 44)
-        delta = data_pos - SKIN_HEADER_SIZE
+        out_buf.extend(payload)
+        delta = data_pos - skin_header_size
 
-        profile = bytearray(blob[:SKIN_HEADER_SIZE])
+        profile = bytearray(profile_bytes)
         for field_count_off in SKIN_M2ARRAY_FIELD_OFFSETS:
             count = u32(profile, field_count_off)
             ofs = u32(profile, field_count_off + 4)
             if count > 0 and ofs > 0:
                 write_u32(profile, field_count_off + 4, ofs + delta)
-        slot = skin_array_pos + i * SKIN_HEADER_SIZE
-        out_buf[slot : slot + SKIN_HEADER_SIZE] = profile
+        slot = skin_array_pos + i * SKIN_PROFILE_SIZE
+        out_buf[slot : slot + SKIN_PROFILE_SIZE] = profile
+
+        if verbose:
+            magic_note = "with 'SKIN' magic" if skin_header_size == 48 else "no magic"
+            print(
+                f"  embedded skin #{i} ({magic_note}): profile at "
+                f"{slot:#x}, data at {data_pos:#x} ({len(payload)} bytes)"
+            )
 
     return skin_array_pos
 
@@ -705,15 +740,10 @@ def convert(
         write_u32(out, new_pos, old_value + HEADER_SHIFT)
 
     # ---- embed .skin files ----------------------------------------------
-    skin_array_pos = embed_skin_files(out, skin_blobs)
+    skin_array_pos = embed_skin_files(out, skin_blobs, verbose=verbose)
     # Set TBC ofsViews
     if skin_array_pos:
         write_u32(out, wotlk_to_tbc_field(WotLK.NUM_VIEWS) + 4, skin_array_pos)
-        if verbose:
-            print(
-                f"embedded {len(skin_blobs)} skin profile(s) at "
-                f"{skin_array_pos:#x}"
-            )
 
     # ---- embed .anim files and rewrite external M2Track inner offsets ----
     anim_positions: Dict[int, int] = {}
