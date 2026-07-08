@@ -1300,6 +1300,11 @@
     "db2FileDataID": 6405757
   },
   {
+    "tableName": "CooldownViewerItemSpell",
+    "tableHash": "BC8023E3",
+    "db2FileDataID": 7939216
+  },
+  {
     "tableName": "CorruptionEffects",
     "tableHash": "B18F44BB",
     "db2FileDataID": 3220711
@@ -1604,6 +1609,11 @@
     "tableName": "DataTagXRecord",
     "tableHash": "D8F6C288",
     "db2FileDataID": 6860787
+  },
+  {
+    "tableName": "DBData_M2Light",
+    "tableHash": "F3CCF5A9",
+    "db2FileDataID": 7813613
   },
   {
     "tableName": "DeathThudLookups",
@@ -5911,6 +5921,11 @@
     "tableName": "TextureFileData",
     "tableHash": "1A473014",
     "db2FileDataID": 982459
+  },
+  {
+    "tableName": "TieredEntrance",
+    "tableHash": "4DDF13A4",
+    "db2FileDataID": 7833678
   },
   {
     "tableName": "TierTransition",
